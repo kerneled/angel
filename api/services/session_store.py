@@ -45,11 +45,14 @@ class SessionStore:
     def _get_session(self) -> Session:
         return self._session_factory()
 
-    def create_session(self, mode: str) -> str:
-        session_id = str(uuid4())
+    def create_session(self, mode: str, session_id: str | None = None) -> str:
+        if session_id is None:
+            session_id = str(uuid4())
         with self._get_session() as db:
-            db.add(SessionRow(id=session_id, mode=mode))
-            db.commit()
+            existing = db.query(SessionRow).filter_by(id=session_id).first()
+            if not existing:
+                db.add(SessionRow(id=session_id, mode=mode))
+                db.commit()
         return session_id
 
     def end_session(self, session_id: str) -> None:
@@ -107,16 +110,30 @@ class SessionStore:
                     .order_by(AnalysisRow.created_at.desc())
                     .first()
                 )
-                last_emotion = None
-                if last and last.vision_json:
-                    v = json.loads(last.vision_json)
-                    last_emotion = v.get("overall_emotion")
+                last_state = None
+                last_interpretation = None
+                last_provider = None
+                if last:
+                    last_interpretation = last.interpretation
+                    last_provider = last.provider
+                    if last.vision_json:
+                        v = json.loads(last.vision_json)
+                        # New probabilistic format: extract primary state from hypotheses
+                        hypotheses = v.get("hypotheses", [])
+                        if hypotheses:
+                            best = max(hypotheses, key=lambda h: h.get("probability", 0))
+                            last_state = best.get("state")
+                        else:
+                            # Fallback for old format
+                            last_state = v.get("behavioral_state") or v.get("overall_emotion")
                 result.append(
                     {
                         "id": r.id,
                         "mode": r.mode,
                         "analysis_count": count,
-                        "last_emotion": last_emotion,
+                        "last_state": last_state,
+                        "last_interpretation": last_interpretation,
+                        "last_provider": last_provider,
                         "created_at": r.created_at.isoformat() if r.created_at else None,
                         "ended_at": r.ended_at.isoformat() if r.ended_at else None,
                     }

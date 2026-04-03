@@ -3,15 +3,12 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from typing import Optional
 
 import numpy as np
 
-from models.schemas import AudioLabel, AudioResult
+from models.schemas import AudioFeatures, AudioLatentState, AudioResult, BehavioralHypothesis
 
 logger = logging.getLogger("dogsense.audio")
-
-LABELS = list(AudioLabel)
 
 
 async def process_audio_chunk(
@@ -46,13 +43,30 @@ async def _wav2vec2_inference(
             logits = model(**inputs).logits
         probs = torch.nn.functional.softmax(logits, dim=-1)[0]
 
-        num_labels = min(len(LABELS), probs.shape[0])
-        scores = {LABELS[i].value: float(probs[i]) for i in range(num_labels)}
-        best_idx = int(probs[:num_labels].argmax())
+        # Map model outputs to behavioral states
+        state_map = ["relaxed", "fearful", "playful", "anxious", "excited", "defensive_aggression", "excited"]
+        num = min(len(state_map), probs.shape[0])
+        hypotheses = []
+        for i in range(num):
+            if float(probs[i]) > 0.05:
+                hypotheses.append(BehavioralHypothesis(state=state_map[i], probability=float(probs[i])))
+
+        # Normalize
+        total = sum(h.probability for h in hypotheses)
+        if total > 0:
+            for h in hypotheses:
+                h.probability = round(h.probability / total, 3)
+
+        hypotheses.sort(key=lambda h: h.probability, reverse=True)
+
+        best_prob = hypotheses[0].probability if hypotheses else 0
+        arousal = int(min(10, best_prob * 10))
+
         return AudioResult(
-            label=LABELS[best_idx],
-            confidence=float(probs[best_idx]),
-            all_scores=scores,
+            features=AudioFeatures(type="bark", intensity="medium", pitch="mid", rhythm="isolated"),
+            latent_state=AudioLatentState(arousal=arousal, valence=0.0),
+            hypotheses=hypotheses[:4],
+            uncertainty="medium",
         )
 
     return await asyncio.to_thread(_run)
@@ -66,35 +80,66 @@ async def _librosa_fallback(
 
     def _run():
         waveform = _decode_audio(audio_bytes, sample_rate)
-        mfcc = librosa.feature.mfcc(y=waveform, sr=sample_rate, n_mfcc=13)
         energy = float(np.mean(librosa.feature.rms(y=waveform)))
         zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=waveform)))
         spectral_centroid = float(
             np.mean(librosa.feature.spectral_centroid(y=waveform, sr=sample_rate))
         )
 
-        if energy > 0.1 and spectral_centroid > 3000:
-            label = AudioLabel.ALERT
-            confidence = min(0.7, energy * 2)
-        elif energy > 0.08 and zcr > 0.15:
-            label = AudioLabel.AGGRESSION
-            confidence = 0.5
-        elif energy < 0.02:
-            label = AudioLabel.LONELINESS
-            confidence = 0.4
-        elif spectral_centroid > 2000:
-            label = AudioLabel.PLAYFUL
-            confidence = 0.5
-        elif zcr < 0.05 and energy < 0.05:
-            label = AudioLabel.FEAR
-            confidence = 0.4
-        else:
-            label = AudioLabel.ATTENTION
-            confidence = 0.3
+        # Determine features
+        pitch = "high" if spectral_centroid > 3000 else "mid" if spectral_centroid > 1500 else "low"
+        intensity = "high" if energy > 0.1 else "medium" if energy > 0.03 else "low"
 
-        scores = {l.value: 0.0 for l in LABELS}
-        scores[label.value] = confidence
-        return AudioResult(label=label, confidence=confidence, all_scores=scores)
+        # Build probabilistic hypotheses from heuristics
+        hypotheses: list[BehavioralHypothesis] = []
+
+        if energy > 0.1 and spectral_centroid > 3000:
+            hypotheses = [
+                BehavioralHypothesis(state="excited", probability=0.5),
+                BehavioralHypothesis(state="anxious", probability=0.3),
+                BehavioralHypothesis(state="defensive_aggression", probability=0.2),
+            ]
+            arousal = 8
+            valence = -0.2
+        elif energy > 0.08 and zcr > 0.15:
+            hypotheses = [
+                BehavioralHypothesis(state="defensive_aggression", probability=0.5),
+                BehavioralHypothesis(state="fearful", probability=0.3),
+                BehavioralHypothesis(state="anxious", probability=0.2),
+            ]
+            arousal = 7
+            valence = -0.6
+        elif energy < 0.02:
+            hypotheses = [
+                BehavioralHypothesis(state="relaxed", probability=0.6),
+                BehavioralHypothesis(state="anxious", probability=0.25),
+                BehavioralHypothesis(state="fearful", probability=0.15),
+            ]
+            arousal = 2
+            valence = -0.1
+        elif spectral_centroid > 2000:
+            hypotheses = [
+                BehavioralHypothesis(state="playful", probability=0.5),
+                BehavioralHypothesis(state="excited", probability=0.35),
+                BehavioralHypothesis(state="anxious", probability=0.15),
+            ]
+            arousal = 6
+            valence = 0.4
+        else:
+            hypotheses = [
+                BehavioralHypothesis(state="relaxed", probability=0.4),
+                BehavioralHypothesis(state="anxious", probability=0.3),
+                BehavioralHypothesis(state="excited", probability=0.3),
+            ]
+            arousal = 4
+            valence = 0.0
+
+        return AudioResult(
+            features=AudioFeatures(pitch=pitch, intensity=intensity, rhythm="isolated", type="bark"),
+            latent_state=AudioLatentState(arousal=arousal, valence=valence),
+            hypotheses=hypotheses,
+            uncertainty="high",
+        )
 
     return await asyncio.to_thread(_run)
 

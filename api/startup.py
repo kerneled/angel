@@ -12,8 +12,10 @@ _audio_processor = None
 def preload_audio_model() -> bool:
     global _audio_model, _audio_processor
 
-    model_name = os.getenv("HF_MODEL_AUDIO", "facebook/wav2vec2-base")
-    cache_dir = os.getenv("HF_CACHE_DIR", "/app/models")
+    from config import settings
+
+    model_name = settings.hf_model_audio
+    cache_dir = settings.hf_cache_dir
 
     try:
         from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2Processor

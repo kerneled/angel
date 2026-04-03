@@ -9,6 +9,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from config import settings
 from deps import get_store
 from services.audio_processor import process_audio_chunk
+from services.frame_aggregator import FrameAggregator
 from services.llm_router import LLMRouter, LLMUsage, create_router
 from services.vision_processor import analyze_frame, stream_interpretation
 
@@ -38,11 +39,20 @@ async def websocket_endpoint(
 ):
     await websocket.accept()
     store = get_store()
-    llm = _get_llm_router()
 
-    store.create_session(mode=mode)
+    try:
+        llm = _get_llm_router()
+    except Exception as e:
+        logger.error("LLM Router init failed: %s", e)
+        await websocket.send_json({"type": "error", "message": f"LLM init failed: {e}"})
+        await websocket.close()
+        return
+
+    store.create_session(session_id=session_id, mode=mode)
     logger.info("WS connected: session=%s mode=%s", session_id, mode)
 
+    aggregator = FrameAggregator()
+    session_cost = 0.0
     ping_task = asyncio.create_task(_ping_loop(websocket))
 
     try:
@@ -54,24 +64,31 @@ async def websocket_endpoint(
                 msg_type = msg.get("type")
 
                 if msg_type == "frame" and mode in ("video", "combined"):
-                    await _handle_frame(websocket, llm, store, session_id, msg)
+                    cost = await _handle_frame(
+                        websocket, llm, store, session_id, msg, aggregator
+                    )
+                    session_cost += cost
                 elif msg_type == "audio_chunk" and mode in ("audio", "combined"):
                     data = msg.get("data", "")
                     import base64
 
                     audio_bytes = base64.b64decode(data)
-                    await _handle_audio(
+                    cost = await _handle_audio(
                         websocket, llm, store, session_id, audio_bytes
                     )
+                    session_cost += cost
 
             elif "bytes" in raw:
                 if mode in ("audio", "combined"):
-                    await _handle_audio(
+                    cost = await _handle_audio(
                         websocket, llm, store, session_id, raw["bytes"]
                     )
+                    session_cost += cost
 
     except WebSocketDisconnect:
-        logger.info("WS disconnected: session=%s", session_id)
+        logger.info(
+            "WS disconnected: session=%s total_cost=$%.4f", session_id, session_cost
+        )
     except Exception as e:
         logger.error("WS error: session=%s %s", session_id, e)
         await _send_error(websocket, str(e))
@@ -86,28 +103,59 @@ async def _handle_frame(
     store,
     session_id: str,
     msg: dict,
-):
+    aggregator: FrameAggregator,
+) -> float:
+    """Returns cost in USD for this frame analysis."""
     image_b64 = msg.get("data", "")
     if not image_b64:
-        return
+        return 0.0
+
+    total_cost = 0.0
 
     try:
         analysis, vision_usage = await analyze_frame(llm, image_b64)
+        total_cost += vision_usage.cost_usd
 
-        await ws.send_json(
-            {"type": "result", "payload": analysis.model_dump()}
-        )
+        # Add to aggregator
+        aggregator.add(analysis)
+        aggregate = aggregator.aggregate()
 
+        # Send structured result + aggregate
+        await ws.send_json({
+            "type": "result",
+            "payload": {
+                **analysis.model_dump(),
+                "aggregate": aggregate.model_dump(),
+                "cost_usd": round(total_cost, 5),
+                "provider": vision_usage.provider,
+                "latency_ms": vision_usage.latency_ms,
+            },
+        })
+
+        # Stream interpretation with aggregate context
         interpretation_text = ""
         interp_usage: LLMUsage | None = None
 
-        async for token, usage in stream_interpretation(llm, analysis):
+        async for token, usage in stream_interpretation(llm, analysis, aggregate):
             if token:
                 interpretation_text += token
                 await ws.send_json({"type": "token", "content": token})
             if usage:
                 interp_usage = usage
 
+        if interp_usage:
+            total_cost += interp_usage.cost_usd
+
+        # Send final cost
+        await ws.send_json({
+            "type": "aggregate",
+            "payload": {
+                "aggregate": aggregate.model_dump(),
+                "frame_cost_usd": round(total_cost, 5),
+            },
+        })
+
+        # Persist
         total_prompt = vision_usage.prompt_tokens
         total_completion = vision_usage.completion_tokens
         total_latency = vision_usage.latency_ms
@@ -132,6 +180,8 @@ async def _handle_frame(
         logger.error("Frame analysis error: %s", e)
         await _send_error(ws, f"Vision analysis failed: {e}")
 
+    return total_cost
+
 
 async def _handle_audio(
     ws: WebSocket,
@@ -139,13 +189,14 @@ async def _handle_audio(
     store,
     session_id: str,
     audio_bytes: bytes,
-):
+) -> float:
+    """Returns cost in USD for this audio analysis."""
+    total_cost = 0.0
+
     try:
         result = await process_audio_chunk(audio_bytes)
 
-        await ws.send_json(
-            {"type": "result", "payload": result.model_dump()}
-        )
+        await ws.send_json({"type": "result", "payload": result.model_dump()})
 
         interpretation_text = ""
         interp_usage: LLMUsage | None = None
@@ -157,6 +208,9 @@ async def _handle_audio(
                 await ws.send_json({"type": "token", "content": token})
             if usage:
                 interp_usage = usage
+
+        if interp_usage:
+            total_cost += interp_usage.cost_usd
 
         store.save_analysis(
             session_id=session_id,
@@ -172,6 +226,8 @@ async def _handle_audio(
     except Exception as e:
         logger.error("Audio analysis error: %s", e)
         await _send_error(ws, f"Audio analysis failed: {e}")
+
+    return total_cost
 
 
 async def _ping_loop(ws: WebSocket):

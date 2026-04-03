@@ -5,6 +5,7 @@ const nextConfig: NextConfig = {
   output: "standalone",
   reactStrictMode: true,
   turbopack: {},
+  allowedDevOrigins: ["192.168.50.130", "dogsense.eac-bt.com"],
 };
 
 export default withPWA({

@@ -2,10 +2,10 @@
 
 # --- Development (local) ---
 api:
-	cd api && uvicorn main:app --reload --host 0.0.0.0 --port 8000
+	cd api && uvicorn main:app --reload --host 0.0.0.0 --port 8030
 
 frontend:
-	cd frontend && npm run dev
+	cd frontend && npm run dev -- --hostname 0.0.0.0
 
 # --- Docker ---
 up:
@@ -26,4 +26,4 @@ clean:
 	rm -rf data/sessions.db
 
 health:
-	curl -s http://localhost:8000/api/health | python3 -m json.tool
+	curl -s http://localhost:8030/api/health | python3 -m json.tool

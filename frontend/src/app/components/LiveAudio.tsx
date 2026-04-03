@@ -7,7 +7,7 @@ import { EmotionBadge } from "./EmotionBadge";
 import { ResultCard } from "./ResultCard";
 
 export function LiveAudio() {
-  const [sessionId] = useState(() => crypto.randomUUID());
+  const [sessionId] = useState(() => crypto.randomUUID?.() ?? Math.random().toString(36).slice(2) + Date.now().toString(36));
   const [running, setRunning] = useState(false);
   const [emotion, setEmotion] = useState<string | null>(null);
   const [confidence, setConfidence] = useState<number | null>(null);
@@ -112,18 +112,17 @@ export function LiveAudio() {
         isStreaming={streaming}
       />
 
-      <div className="flex justify-center pb-4">
-        <button
-          onClick={running ? handleStop : handleStart}
-          className={`min-w-[64px] min-h-[64px] rounded-full text-white text-2xl font-bold shadow-lg transition-colors ${
-            running
-              ? "bg-red-600 active:bg-red-700"
-              : "bg-[#e94560] active:bg-[#c73e54]"
-          }`}
-        >
-          {running ? "■" : "▶"}
-        </button>
-      </div>
+      {/* FAB - floating action button */}
+      <button
+        onClick={running ? handleStop : handleStart}
+        className={`fixed bottom-24 right-6 z-50 w-16 h-16 rounded-full text-white text-2xl font-bold shadow-xl transition-colors ${
+          running
+            ? "bg-red-600 active:bg-red-700"
+            : "bg-[#e94560] active:bg-[#c73e54]"
+        }`}
+      >
+        {running ? "■" : "▶"}
+      </button>
     </div>
   );
 }

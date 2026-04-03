@@ -8,34 +8,34 @@ import time
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Optional
 
+from services.prompts import (
+    VISION_PROMPT_STREAM,
+    VISION_PROMPT_PHOTO,
+    INTERPRETATION_PROMPT_STREAM,
+    INTERPRETATION_PROMPT_PHOTO,
+    INTERPRETATION_PROMPT_VIDEO,
+)
+
 logger = logging.getLogger("dogsense.llm")
 
-VISION_PROMPT = """Analyze this image of a dog. Return ONLY valid JSON, no explanation:
-{
-  "dog_detected": true|false,
-  "tail_position": "high|mid|low|tucked|wagging|unknown",
-  "ear_orientation": "forward|back|relaxed|asymmetric|unknown",
-  "body_posture": "upright|crouched|play-bow|stiff|relaxed|unknown",
-  "facial_expression": "relaxed|tense|teeth-showing|yawning|unknown",
-  "piloerection": "visible|not-visible|uncertain",
-  "overall_emotion": "happy|fearful|aggressive|anxious|playful|neutral|pain",
-  "confidence": 0.0-1.0,
-  "urgency": "low|medium|high",
-  "summary": "one sentence for owner"
+# --- Cost tracking (USD per 1M tokens, April 2025 pricing) ---
+COST_PER_1M = {
+    "claude": {"input": 3.00, "output": 15.00},
+    "gemini": {"input": 0.10, "output": 0.40},
 }
-If no dog is detected, return dog_detected: false and null for all other fields."""
 
-INTERPRETATION_PROMPT = """You are an expert canine behaviorist. Based on the following structured analysis of a dog's body language, provide a brief, actionable interpretation for the owner in Portuguese (Brazilian).
+def get_vision_prompt(mode: str = "stream") -> str:
+    if mode == "photo":
+        return VISION_PROMPT_PHOTO
+    return VISION_PROMPT_STREAM
 
-Analysis data:
-{analysis_json}
 
-Respond with:
-1. What the dog is likely feeling (1 sentence)
-2. What the owner should do (1 sentence)
-3. Any urgency note if applicable
-
-Keep it concise and friendly. Max 3 sentences total."""
+def get_interpretation_prompt(mode: str = "stream") -> str:
+    if mode == "photo":
+        return INTERPRETATION_PROMPT_PHOTO
+    elif mode == "video":
+        return INTERPRETATION_PROMPT_VIDEO
+    return INTERPRETATION_PROMPT_STREAM
 
 
 class LLMUsage:
@@ -51,17 +51,25 @@ class LLMUsage:
         self.completion_tokens = completion_tokens
         self.latency_ms = latency_ms
 
+    @property
+    def cost_usd(self) -> float:
+        rates = COST_PER_1M.get(self.provider, {"input": 0, "output": 0})
+        return (
+            self.prompt_tokens * rates["input"] / 1_000_000
+            + self.completion_tokens * rates["output"] / 1_000_000
+        )
+
 
 class LLMProvider(ABC):
     name: str
 
     @abstractmethod
-    async def analyze_image(self, image_b64: str) -> tuple[dict, LLMUsage]:
+    async def analyze_image(self, image_b64: str, mode: str = "stream") -> tuple[dict, LLMUsage]:
         """Send image to vision API, return structured JSON + usage."""
 
     @abstractmethod
     async def stream_interpretation(
-        self, analysis_json: str
+        self, analysis_json: str, aggregate_json: str = "null", mode: str = "stream"
     ) -> AsyncIterator[tuple[str, Optional[LLMUsage]]]:
         """Stream interpretation tokens. Last yield includes usage."""
 
@@ -75,11 +83,13 @@ class ClaudeProvider(LLMProvider):
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._model = "claude-sonnet-4-20250514"
 
-    async def analyze_image(self, image_b64: str) -> tuple[dict, LLMUsage]:
+    async def analyze_image(self, image_b64: str, mode: str = "stream") -> tuple[dict, LLMUsage]:
         start = time.monotonic()
+        vision_prompt = get_vision_prompt(mode)
+        max_tokens = 2048 if mode == "photo" else 1024
         response = await self._client.messages.create(
             model=self._model,
-            max_tokens=512,
+            max_tokens=max_tokens,
             messages=[
                 {
                     "role": "user",
@@ -92,7 +102,7 @@ class ClaudeProvider(LLMProvider):
                                 "data": image_b64,
                             },
                         },
-                        {"type": "text", "text": VISION_PROMPT},
+                        {"type": "text", "text": vision_prompt},
                     ],
                 }
             ],
@@ -109,16 +119,21 @@ class ClaudeProvider(LLMProvider):
         return parsed, usage
 
     async def stream_interpretation(
-        self, analysis_json: str
+        self, analysis_json: str, aggregate_json: str = "null", mode: str = "stream"
     ) -> AsyncIterator[tuple[str, Optional[LLMUsage]]]:
         start = time.monotonic()
-        prompt = INTERPRETATION_PROMPT.format(analysis_json=analysis_json)
+        interp_prompt = get_interpretation_prompt(mode)
+        prompt = interp_prompt.format(
+            analysis_json=analysis_json,
+            aggregate_json=aggregate_json,
+        )
         input_tokens = 0
         output_tokens = 0
 
+        max_tokens = 1024 if mode == "photo" else 512
         async with self._client.messages.stream(
             model=self._model,
-            max_tokens=256,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             async for event in stream:
@@ -144,30 +159,33 @@ class GeminiProvider(LLMProvider):
     name = "gemini"
 
     def __init__(self, api_key: str):
-        import google.generativeai as genai
+        from google import genai
 
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel("gemini-2.0-flash")
+        self._client = genai.Client(api_key=api_key)
+        self._model_id = "gemini-2.0-flash"
 
-    async def analyze_image(self, image_b64: str) -> tuple[dict, LLMUsage]:
-        import google.generativeai as genai
+    async def analyze_image(self, image_b64: str, mode: str = "stream") -> tuple[dict, LLMUsage]:
+        from google.genai import types
 
         start = time.monotonic()
         image_bytes = base64.b64decode(image_b64)
-        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
+        vision_prompt = get_vision_prompt(mode)
 
         response = await asyncio.to_thread(
-            self._model.generate_content, [image_part, VISION_PROMPT]
+            self._client.models.generate_content,
+            model=self._model_id,
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                vision_prompt,
+            ],
         )
         latency = int((time.monotonic() - start) * 1000)
 
         prompt_tokens = 0
         completion_tokens = 0
-        if hasattr(response, "usage_metadata"):
-            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0)
-            completion_tokens = getattr(
-                response.usage_metadata, "candidates_token_count", 0
-            )
+        if response.usage_metadata:
+            prompt_tokens = response.usage_metadata.prompt_token_count or 0
+            completion_tokens = response.usage_metadata.candidates_token_count or 0
 
         usage = LLMUsage(
             provider=self.name,
@@ -179,26 +197,30 @@ class GeminiProvider(LLMProvider):
         return parsed, usage
 
     async def stream_interpretation(
-        self, analysis_json: str
+        self, analysis_json: str, aggregate_json: str = "null", mode: str = "stream"
     ) -> AsyncIterator[tuple[str, Optional[LLMUsage]]]:
         start = time.monotonic()
-        prompt = INTERPRETATION_PROMPT.format(analysis_json=analysis_json)
-
-        response = await asyncio.to_thread(
-            self._model.generate_content, prompt, stream=True
+        interp_prompt = get_interpretation_prompt(mode)
+        prompt = interp_prompt.format(
+            analysis_json=analysis_json,
+            aggregate_json=aggregate_json,
         )
 
-        for chunk in response:
-            if chunk.text:
-                yield chunk.text, None
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
+            model=self._model_id,
+            contents=prompt,
+        )
+
+        # google-genai doesn't support streaming the same way, emit full text
+        if response.text:
+            yield response.text, None
 
         prompt_tokens = 0
         completion_tokens = 0
-        if hasattr(response, "usage_metadata"):
-            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0)
-            completion_tokens = getattr(
-                response.usage_metadata, "candidates_token_count", 0
-            )
+        if response.usage_metadata:
+            prompt_tokens = response.usage_metadata.prompt_token_count or 0
+            completion_tokens = response.usage_metadata.candidates_token_count or 0
 
         latency = int((time.monotonic() - start) * 1000)
         yield "", LLMUsage(
@@ -214,28 +236,30 @@ class LLMRouter:
         self.primary = primary
         self.fallback = fallback
 
-    async def analyze_image(self, image_b64: str) -> tuple[dict, LLMUsage]:
+    async def analyze_image(self, image_b64: str, mode: str = "stream") -> tuple[dict, LLMUsage]:
         try:
-            return await self.primary.analyze_image(image_b64)
+            return await self.primary.analyze_image(image_b64, mode)
         except Exception as e:
             logger.warning("Primary LLM (%s) failed: %s", self.primary.name, e)
             if self.fallback:
                 logger.info("Falling back to %s", self.fallback.name)
-                return await self.fallback.analyze_image(image_b64)
+                return await self.fallback.analyze_image(image_b64, mode)
             raise
 
     async def stream_interpretation(
-        self, analysis_json: str
+        self, analysis_json: str, aggregate_json: str = "null", mode: str = "stream"
     ) -> AsyncIterator[tuple[str, Optional[LLMUsage]]]:
         try:
-            async for token, usage in self.primary.stream_interpretation(analysis_json):
+            async for token, usage in self.primary.stream_interpretation(
+                analysis_json, aggregate_json, mode
+            ):
                 yield token, usage
         except Exception as e:
             logger.warning("Primary LLM (%s) failed: %s", self.primary.name, e)
             if self.fallback:
                 logger.info("Falling back to %s", self.fallback.name)
                 async for token, usage in self.fallback.stream_interpretation(
-                    analysis_json
+                    analysis_json, aggregate_json, mode
                 ):
                     yield token, usage
             else:

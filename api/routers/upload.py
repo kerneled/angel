@@ -91,11 +91,11 @@ async def _process_audio(content: bytes, llm, store, session_id: str):
 
 async def _process_image(content: bytes, llm, store, session_id: str):
     image_b64 = base64.b64encode(content).decode()
-    analysis, vision_usage = await analyze_frame(llm, image_b64)
+    analysis, vision_usage = await analyze_frame(llm, image_b64, mode="photo")
 
     interpretation_text = ""
     interp_usage = None
-    async for token, usage in stream_interpretation(llm, analysis):
+    async for token, usage in stream_interpretation(llm, analysis, mode="photo"):
         if token:
             interpretation_text += token
         if usage:
@@ -127,38 +127,65 @@ async def _process_image(content: bytes, llm, store, session_id: str):
 
 
 async def _process_video(content: bytes, llm, store, session_id: str):
-    frames = await _extract_keyframes(content)
-    results = []
+    from services.frame_aggregator import FrameAggregator
 
+    frames = await _extract_keyframes(content)
+    aggregator = FrameAggregator()
+    frame_analyses = []
+    total_prompt = 0
+    total_completion = 0
+    total_latency = 0
+    provider_name = None
+
+    # Analyze all frames and aggregate
     for i, frame_bytes in enumerate(frames):
         image_b64 = base64.b64encode(frame_bytes).decode()
-        analysis, usage = await analyze_frame(llm, image_b64)
+        analysis, usage = await analyze_frame(llm, image_b64, mode="video")
+        aggregator.add(analysis)
+        frame_analyses.append(analysis)
+        total_prompt += usage.prompt_tokens
+        total_completion += usage.completion_tokens
+        total_latency += usage.latency_ms
+        provider_name = usage.provider
 
-        interpretation_text = ""
-        async for token, _ in stream_interpretation(llm, analysis):
+    aggregate = aggregator.aggregate()
+
+    # Single unified interpretation using aggregate context
+    best_analysis = next(
+        (a for a in frame_analyses if a.dog_detected),
+        frame_analyses[-1] if frame_analyses else None,
+    )
+
+    interpretation_text = ""
+    if best_analysis:
+        async for token, usage in stream_interpretation(llm, best_analysis, aggregate, mode="video"):
             if token:
                 interpretation_text += token
+            if usage:
+                total_prompt += usage.prompt_tokens
+                total_completion += usage.completion_tokens
+                total_latency += usage.latency_ms
 
-        store.save_analysis(
-            session_id=session_id,
-            mode="video",
-            vision=analysis.model_dump(),
-            interpretation=interpretation_text,
-            provider=usage.provider,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-            latency_ms=usage.latency_ms,
-        )
+    # Save single consolidated analysis
+    store.save_analysis(
+        session_id=session_id,
+        mode="video",
+        vision=best_analysis.model_dump() if best_analysis else None,
+        interpretation=interpretation_text,
+        provider=provider_name,
+        prompt_tokens=total_prompt,
+        completion_tokens=total_completion,
+        latency_ms=total_latency,
+    )
 
-        results.append(
-            {
-                "frame": i + 1,
-                "vision": analysis.model_dump(),
-                "interpretation": interpretation_text,
-            }
-        )
-
-    return {"session_id": session_id, "type": "video", "frames": results}
+    return {
+        "session_id": session_id,
+        "type": "video",
+        "vision": best_analysis.model_dump() if best_analysis else None,
+        "aggregate": aggregate.model_dump(),
+        "interpretation": interpretation_text,
+        "frame_count": len(frames),
+    }
 
 
 async def _extract_keyframes(video_bytes: bytes, num_frames: int = 5) -> list[bytes]:
