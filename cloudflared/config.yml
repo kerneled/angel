@@ -1,0 +1,21 @@
+# Cloudflare Zero Trust Tunnel Configuration
+# 1. Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+# 2. Authenticate: cloudflared tunnel login
+# 3. Create tunnel: cloudflared tunnel create dogsense
+# 4. Replace <TUNNEL_ID> below with the actual tunnel ID
+# 5. Add DNS: cloudflared tunnel route dns dogsense dogsense.yourdomain.com
+# 6. Run: cloudflared tunnel run dogsense
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/edcarmo/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: dogsense.yourdomain.com
+    service: http://localhost:8000
+    originRequest:
+      noTLSVerify: true
+  - hostname: app.dogsense.yourdomain.com
+    service: http://localhost:3000
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
